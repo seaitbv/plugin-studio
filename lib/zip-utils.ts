@@ -2,85 +2,103 @@ import JSZip from "jszip";
 import matter from "gray-matter";
 import { Plugin, AgentConfig, SkillConfig, McpServer } from "./plugin-types";
 
-/**
- * Robustly parse an agent .md file.
- * Handles real-world dirty frontmatter:
- * - <example> XML blocks inside the YAML section
- * - multi-line description values
- * - JSON array tools
- */
-function parseAgentFile(content: string, fallbackName: string): { data: Record<string, unknown>; body: string } {
-  // Try standard gray-matter first
+// ─── Robust agent frontmatter parser ────────────────────────────────────────
+// Real-world agent files often have:
+//   - <example> XML blocks inside the YAML section (invalid YAML → gray-matter crashes)
+//   - tools as JSON array: ["Read", "Write"]  (should be string: Read, Write)
+//   - multiline description values
+// We strip XML first, then parse line-by-line.
+
+function parseAgentFile(
+  content: string,
+  fallbackName: string
+): { data: Record<string, unknown>; body: string } {
+  // Split on the frontmatter delimiters
+  // Match: ---\n<frontmatter>\n---\n<body>
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!match) {
+    // No frontmatter at all — whole file is body
+    return { data: { name: fallbackName }, body: content.trim() };
+  }
+
+  const rawFm = match[1];
+  const body = match[2].trim();
+
+  // Strip XML/HTML blocks (e.g. <example>...</example>) — they break YAML parsing
+  const cleanFm = rawFm
+    .replace(/<\w[^>]*>[\s\S]*?<\/\w[^>]*>/g, "")
+    .replace(/<[^>]+\/>/g, "")
+    .replace(/^\s*[\r\n]/gm, "") // remove blank lines left by XML removal
+    .trim();
+
+  // Try gray-matter on the cleaned frontmatter
   try {
-    const parsed = matter(content);
-    // If we got at least a name or description, trust it
-    if (parsed.data && (parsed.data.name || parsed.data.description || parsed.data.model)) {
+    const rebuilt = `---\n${cleanFm}\n---\n${body}`;
+    const parsed = matter(rebuilt);
+    if (parsed.data && Object.keys(parsed.data).length > 0) {
       return { data: parsed.data, body: parsed.content.trim() };
     }
   } catch {
-    // fall through to manual parser
+    // fall through to line-by-line
   }
 
-  // Manual parser: extract frontmatter between first --- and last --- before body
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
-  if (!fmMatch) {
-    return { data: { name: fallbackName }, body: content };
-  }
-
-  const rawFrontmatter = fmMatch[1];
-  const body = fmMatch[2].trim();
+  // Line-by-line YAML parser (handles simple key: value pairs)
   const data: Record<string, unknown> = { name: fallbackName };
-
-  // Strip XML blocks like <example>...</example> and <commentary>...</commentary>
-  const cleanedFm = rawFrontmatter
-    .replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "")
-    .replace(/<[^>]+\/>/g, "")
-    .trim();
-
-  // Parse line by line
   let currentKey = "";
   let currentValue = "";
 
-  const flushCurrent = () => {
-    if (currentKey) {
-      data[currentKey] = currentValue.trim();
+  const flush = () => {
+    if (!currentKey) return;
+    const v = currentValue.trim();
+    // Try to parse as JSON (handles arrays like ["Read","Write"])
+    if (v.startsWith("[") || v.startsWith("{")) {
+      try {
+        data[currentKey] = JSON.parse(v);
+        return;
+      } catch { /* keep as string */ }
     }
+    data[currentKey] = v;
   };
 
-  for (const line of cleanedFm.split("\n")) {
-    // key: value line
-    const kvMatch = line.match(/^([a-zA-Z_][\w-]*):\s*(.*)$/);
-    if (kvMatch) {
-      flushCurrent();
-      currentKey = kvMatch[1];
-      currentValue = kvMatch[2];
-    } else if (currentKey && line.startsWith("  ")) {
-      // continuation of multiline value
+  for (const line of cleanFm.split(/\r?\n/)) {
+    const kv = line.match(/^([a-zA-Z_][\w-]*):\s*(.*)$/);
+    if (kv) {
+      flush();
+      currentKey = kv[1];
+      currentValue = kv[2];
+    } else if (currentKey && /^\s{2}/.test(line)) {
       currentValue += " " + line.trim();
     }
   }
-  flushCurrent();
-
-  // Parse tools from JSON array string if needed
-  if (typeof data.tools === "string") {
-    const toolStr = data.tools as string;
-    if (toolStr.startsWith("[")) {
-      try {
-        data.tools = JSON.parse(toolStr);
-      } catch {
-        // leave as string
-      }
-    }
-  }
+  flush();
 
   return { data, body };
 }
+
+function normalizeTools(raw: unknown): string[] {
+  if (!raw) return [];
+  if (typeof raw === "string") {
+    // Could be "Read, Write, Bash" or '["Read","Write"]'
+    const s = raw.trim();
+    if (s.startsWith("[")) {
+      try {
+        const arr = JSON.parse(s);
+        if (Array.isArray(arr)) return arr.map(String);
+      } catch { /* fall through */ }
+    }
+    return s.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  if (Array.isArray(raw)) return raw.map(String);
+  return [];
+}
+
+// ─── Export ──────────────────────────────────────────────────────────────────
 
 export async function exportPluginToZip(plugin: Plugin): Promise<Blob> {
   const zip = new JSZip();
   const root = zip.folder(plugin.manifest.name)!;
 
-  // plugin.json
+  // .claude-plugin/plugin.json
   const manifestDir = root.folder(".claude-plugin")!;
   manifestDir.file(
     "plugin.json",
@@ -100,20 +118,20 @@ export async function exportPluginToZip(plugin: Plugin): Promise<Blob> {
   if (plugin.agents.length > 0) {
     const agentsDir = root.folder("agents")!;
     for (const agent of plugin.agents) {
-      const frontmatter: Record<string, unknown> = {
+      const fm: Record<string, unknown> = {
         name: agent.name,
         description: agent.description,
         model: agent.model,
       };
-      if (agent.tools.length > 0) frontmatter.tools = agent.tools.join(", ");
-      if (agent.mcpServers.length > 0) frontmatter.mcpServers = agent.mcpServers;
+      if (agent.tools.length > 0) fm.tools = agent.tools.join(", ");
+      if (agent.mcpServers.length > 0) fm.mcpServers = agent.mcpServers;
       if (agent.permissionMode && agent.permissionMode !== "default")
-        frontmatter.permissionMode = agent.permissionMode;
-      if (agent.maxTurns) frontmatter.maxTurns = agent.maxTurns;
-      if (agent.background) frontmatter.background = agent.background;
-      if (agent.memory && agent.memory !== "none") frontmatter.memory = agent.memory;
+        fm.permissionMode = agent.permissionMode;
+      if (agent.maxTurns) fm.maxTurns = agent.maxTurns;
+      if (agent.background) fm.background = agent.background;
+      if (agent.memory && agent.memory !== "none") fm.memory = agent.memory;
 
-      const fileContent = matter.stringify(agent.systemPrompt || "", frontmatter);
+      const fileContent = matter.stringify(agent.systemPrompt || "", fm);
       agentsDir.file(`${agent.name}.md`, fileContent);
     }
   }
@@ -137,7 +155,7 @@ export async function exportPluginToZip(plugin: Plugin): Promise<Blob> {
       const serverConfig: Record<string, unknown> = {};
       if (server.type === "stdio") {
         serverConfig.command = server.command;
-        if (server.args) serverConfig.args = server.args;
+        if (server.args?.length) serverConfig.args = server.args;
       } else {
         serverConfig.url = server.url;
       }
@@ -158,8 +176,16 @@ export async function exportPluginToZip(plugin: Plugin): Promise<Blob> {
   return zip.generateAsync({ type: "blob" });
 }
 
+// ─── Import ──────────────────────────────────────────────────────────────────
+
 export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> {
-  const zip = await JSZip.loadAsync(file);
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(file);
+  } catch (e) {
+    throw new Error(`Cannot read ZIP file: ${e}`);
+  }
+
   const result: Partial<Plugin> = {
     agents: [],
     skills: [],
@@ -167,89 +193,121 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
     manifest: { name: "", version: "1.0.0" },
   };
 
-  // Find root folder — ignore macOS metadata dirs and hidden dirs
-  const files = Object.keys(zip.files);
-  const topLevelDirs = [...new Set(
-    files
-      .map((f) => f.split("/")[0])
-      .filter((d) => d !== "__MACOSX" && !d.startsWith(".") && d !== "")
-  )];
+  const allFiles = Object.keys(zip.files);
+
+  // Detect root folder (ignore __MACOSX and hidden)
+  const topLevelDirs = [
+    ...new Set(
+      allFiles
+        .map((f) => f.split("/")[0])
+        .filter((d) => d !== "__MACOSX" && !d.startsWith(".") && d !== "")
+    ),
+  ];
   const rootPrefix = topLevelDirs.length === 1 ? topLevelDirs[0] + "/" : "";
 
-  // Parse plugin.json
-  const manifestFile =
-    zip.file(`${rootPrefix}.claude-plugin/plugin.json`) ||
-    zip.file("plugin.json");
-  if (manifestFile) {
-    const content = await manifestFile.async("string");
-    result.manifest = JSON.parse(content);
+  for (const [path, zipFile] of Object.entries(zip.files)) {
+    // Skip dirs, macOS metadata, hidden resource forks
+    if (zipFile.dir) continue;
+    if (path.startsWith("__MACOSX/")) continue;
+    if (path.includes("/._")) continue;
+
+    const rel = rootPrefix ? path.replace(rootPrefix, "") : path;
+    if (!rel || rel.startsWith("__MACOSX")) continue;
+
+    // ── plugin.json ──────────────────────────────────────────────────────────
+    if (rel === ".claude-plugin/plugin.json" || rel === "plugin.json") {
+      try {
+        const content = await zipFile.async("string");
+        result.manifest = JSON.parse(content);
+      } catch { /* ignore malformed manifest */ }
+      continue;
+    }
+
+    // ── agents/*.md ──────────────────────────────────────────────────────────
+    if (rel.startsWith("agents/") && rel.endsWith(".md") && rel.split("/").length === 2) {
+      const fallbackName = rel.split("/")[1].replace(".md", "");
+      try {
+        const content = await zipFile.async("string");
+        const { data, body } = parseAgentFile(content, fallbackName);
+
+        const agent: AgentConfig = {
+          id: crypto.randomUUID(),
+          name: String(data.name ?? fallbackName),
+          description: String(data.description ?? ""),
+          model: (data.model as AgentConfig["model"]) ?? "inherit",
+          tools: normalizeTools(data.tools),
+          mcpServers: Array.isArray(data.mcpServers)
+            ? (data.mcpServers as string[])
+            : [],
+          permissionMode: String(data.permissionMode ?? "default"),
+          maxTurns: data.maxTurns != null ? Number(data.maxTurns) : undefined,
+          background: Boolean(data.background),
+          memory: (data.memory as AgentConfig["memory"]) ?? "none",
+          systemPrompt: body,
+        };
+        result.agents!.push(agent);
+      } catch (e) {
+        console.warn(`Skipping agent ${rel}:`, e);
+      }
+      continue;
+    }
+
+    // ── skills/<name>/SKILL.md ───────────────────────────────────────────────
+    if (rel.match(/^skills\/[^/]+\/SKILL\.md$/)) {
+      const skillName = rel.split("/")[1];
+      try {
+        const content = await zipFile.async("string");
+        let description = "";
+        let body = content;
+        try {
+          const parsed = matter(content);
+          description = String(parsed.data.description ?? "");
+          body = parsed.content.trim();
+        } catch { /* ignore */ }
+
+        const skill: SkillConfig = {
+          id: crypto.randomUUID(),
+          name: skillName,
+          description,
+          content: body,
+        };
+        result.skills!.push(skill);
+      } catch (e) {
+        console.warn(`Skipping skill ${rel}:`, e);
+      }
+      continue;
+    }
+
+    // ── .mcp.json ─────────────────────────────────────────────────────────────
+    if (rel === ".mcp.json") {
+      try {
+        const content = await zipFile.async("string");
+        const mcpConfig = JSON.parse(content);
+        const servers = mcpConfig.mcpServers ?? {};
+        for (const [name, cfg] of Object.entries(servers) as [string, Record<string, unknown>][]) {
+          const server: McpServer = {
+            id: crypto.randomUUID(),
+            name,
+            type: cfg.command ? "stdio" : "http",
+            command: cfg.command as string | undefined,
+            args: cfg.args as string[] | undefined,
+            url: cfg.url as string | undefined,
+            env: (cfg.env as Record<string, string>) ?? {},
+          };
+          result.mcpServers!.push(server);
+        }
+      } catch { /* ignore */ }
+      continue;
+    }
   }
 
-  // Parse agents
-  for (const [path, zipFile] of Object.entries(zip.files)) {
-    if (zipFile.dir) continue;
-    if (path.startsWith("__MACOSX/") || path.includes("/._")) continue;
-    const relativePath = path.replace(rootPrefix, "");
-
-    if (relativePath.startsWith("agents/") && relativePath.endsWith(".md")) {
-      const content = await zipFile.async("string");
-      const { data, body } = parseAgentFile(content, relativePath.split("/").pop()!.replace(".md", ""));
-
-      // Normalize tools: support both "Read, Write" string and ["Read","Write"] array
-      const rawTools = data.tools;
-      let toolsArray: string[] = [];
-      if (typeof rawTools === "string") {
-        toolsArray = rawTools.split(",").map((t: string) => t.trim()).filter(Boolean);
-      } else if (Array.isArray(rawTools)) {
-        toolsArray = rawTools.map((t: unknown) => String(t).trim());
-      }
-
-      const agent: AgentConfig = {
-        id: crypto.randomUUID(),
-        name: String(data.name || relativePath.split("/").pop()!.replace(".md", "")),
-        description: String(data.description || ""),
-        model: (data.model as AgentConfig["model"]) || "inherit",
-        tools: toolsArray,
-        mcpServers: (data.mcpServers as string[]) || [],
-        permissionMode: String(data.permissionMode || "default"),
-        maxTurns: data.maxTurns as number | undefined,
-        background: Boolean(data.background) || false,
-        memory: (data.memory as AgentConfig["memory"]) || "none",
-        systemPrompt: body,
-      };
-      result.agents!.push(agent);
-    }
-
-    if (relativePath.match(/^skills\/[^/]+\/SKILL\.md$/)) {
-      const content = await zipFile.async("string");
-      const parsed = matter(content);
-      const skillName = relativePath.split("/")[1];
-      const skill: SkillConfig = {
-        id: crypto.randomUUID(),
-        name: skillName,
-        description: parsed.data.description || "",
-        content: parsed.content.trim(),
-      };
-      result.skills!.push(skill);
-    }
-
-    if (relativePath === ".mcp.json") {
-      const content = await zipFile.async("string");
-      const mcpConfig = JSON.parse(content);
-      const servers = mcpConfig.mcpServers || {};
-      for (const [name, cfg] of Object.entries(servers) as [string, Record<string, unknown>][]) {
-        const server: McpServer = {
-          id: crypto.randomUUID(),
-          name,
-          type: cfg.command ? "stdio" : "http",
-          command: cfg.command as string | undefined,
-          args: cfg.args as string[] | undefined,
-          url: cfg.url as string | undefined,
-          env: (cfg.env as Record<string, string>) || {},
-        };
-        result.mcpServers!.push(server);
-      }
-    }
+  // Fallback: use ZIP filename as plugin name if manifest had none
+  if (!result.manifest?.name) {
+    result.manifest = {
+      ...result.manifest,
+      name: file.name.replace(/\.zip$/i, "").replace(/[^a-z0-9-]/gi, "-").toLowerCase(),
+      version: "1.0.0",
+    };
   }
 
   return result;
