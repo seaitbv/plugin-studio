@@ -115,16 +115,21 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
     if (relativePath.startsWith("agents/") && relativePath.endsWith(".md")) {
       const content = await zipFile.async("string");
       const parsed = matter(content);
+      // Normalize tools: support both "Read, Write" string and ["Read","Write"] array
+      const rawTools = parsed.data.tools;
+      let toolsArray: string[] = [];
+      if (typeof rawTools === "string") {
+        toolsArray = rawTools.split(",").map((t: string) => t.trim()).filter(Boolean);
+      } else if (Array.isArray(rawTools)) {
+        toolsArray = rawTools.map((t: unknown) => String(t).trim());
+      }
+
       const agent: AgentConfig = {
         id: crypto.randomUUID(),
         name: parsed.data.name || relativePath.split("/").pop()!.replace(".md", ""),
         description: parsed.data.description || "",
         model: parsed.data.model || "inherit",
-        tools: parsed.data.tools
-          ? typeof parsed.data.tools === "string"
-            ? parsed.data.tools.split(",").map((t: string) => t.trim())
-            : parsed.data.tools
-          : [],
+        tools: toolsArray,
         mcpServers: parsed.data.mcpServers || [],
         permissionMode: parsed.data.permissionMode || "default",
         maxTurns: parsed.data.maxTurns,

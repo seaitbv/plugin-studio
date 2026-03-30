@@ -277,6 +277,7 @@ function SidebarItem({ label, color, active, onClick, onDelete }: {
 // ─── Agent Panel ─────────────────────────────────────────────────────────────
 
 import { AVAILABLE_TOOLS } from "@/lib/plugin-types";
+import { validateAgent, getToolSuggestion } from "@/lib/validate";
 
 function AgentPanel({ agent, mcpServers, onChange, onClose }: {
   agent: AgentConfig;
@@ -295,12 +296,40 @@ function AgentPanel({ agent, mcpServers, onChange, onClose }: {
     onChange(AGENT_PRESETS[preset]);
   };
 
+  const issues = validateAgent(agent);
+  const errors = issues.filter((i) => i.severity === "error");
+  const warnings = issues.filter((i) => i.severity === "warning");
+
   return (
     <div className="p-4 space-y-4">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-slate-100">Agent Editor</h3>
         <button onClick={onClose} className="text-slate-500 hover:text-slate-300 text-xl leading-none">×</button>
       </div>
+
+      {/* Validation issues */}
+      {issues.length > 0 && (
+        <div className="space-y-1.5">
+          {errors.map((issue, i) => (
+            <div key={i} className="flex gap-2 px-3 py-2 rounded-lg bg-red-900/20 border border-red-800/40 text-xs">
+              <span className="text-red-400 shrink-0">✕</span>
+              <div>
+                <span className="text-red-300">{issue.message}</span>
+                {issue.fix && <p className="text-red-500 mt-0.5">{issue.fix}</p>}
+              </div>
+            </div>
+          ))}
+          {warnings.map((issue, i) => (
+            <div key={i} className="flex gap-2 px-3 py-2 rounded-lg bg-yellow-900/20 border border-yellow-800/40 text-xs">
+              <span className="text-yellow-400 shrink-0">⚠</span>
+              <div>
+                <span className="text-yellow-300">{issue.message}</span>
+                {issue.fix && <p className="text-yellow-600 mt-0.5">{issue.fix}</p>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Presets */}
       <div>
@@ -357,6 +386,32 @@ function AgentPanel({ agent, mcpServers, onChange, onClose }: {
             </button>
           ))}
         </div>
+        {/* Show invalid tools from import with fix button */}
+        {agent.tools.filter(t => !AVAILABLE_TOOLS.includes(t.replace(/\(.*\)/, ""))).map((badTool) => {
+          const suggestion = getToolSuggestion(badTool.replace(/\(.*\)/, ""));
+          return (
+            <div key={badTool} className="flex items-center gap-2 mt-1.5 px-2 py-1 rounded bg-red-900/20 border border-red-800/40">
+              <span className="text-xs text-red-400 line-through">{badTool}</span>
+              {suggestion && (
+                <button
+                  onClick={() => {
+                    const fixed = agent.tools.map(t => t === badTool ? suggestion : t);
+                    onChange({ tools: fixed });
+                  }}
+                  className="text-xs text-green-400 hover:text-green-300 underline"
+                >
+                  → fix: use {suggestion}
+                </button>
+              )}
+              <button
+                onClick={() => onChange({ tools: agent.tools.filter(t => t !== badTool) })}
+                className="text-xs text-red-600 hover:text-red-400 ml-auto"
+              >
+                remove
+              </button>
+            </div>
+          );
+        })}
       </Field>
 
       <Field label="MCP Servers" hint="Select servers available to this agent">
