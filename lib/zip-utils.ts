@@ -2,6 +2,80 @@ import JSZip from "jszip";
 import matter from "gray-matter";
 import { Plugin, AgentConfig, SkillConfig, McpServer } from "./plugin-types";
 
+/**
+ * Robustly parse an agent .md file.
+ * Handles real-world dirty frontmatter:
+ * - <example> XML blocks inside the YAML section
+ * - multi-line description values
+ * - JSON array tools
+ */
+function parseAgentFile(content: string, fallbackName: string): { data: Record<string, unknown>; body: string } {
+  // Try standard gray-matter first
+  try {
+    const parsed = matter(content);
+    // If we got at least a name or description, trust it
+    if (parsed.data && (parsed.data.name || parsed.data.description || parsed.data.model)) {
+      return { data: parsed.data, body: parsed.content.trim() };
+    }
+  } catch {
+    // fall through to manual parser
+  }
+
+  // Manual parser: extract frontmatter between first --- and last --- before body
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!fmMatch) {
+    return { data: { name: fallbackName }, body: content };
+  }
+
+  const rawFrontmatter = fmMatch[1];
+  const body = fmMatch[2].trim();
+  const data: Record<string, unknown> = { name: fallbackName };
+
+  // Strip XML blocks like <example>...</example> and <commentary>...</commentary>
+  const cleanedFm = rawFrontmatter
+    .replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "")
+    .replace(/<[^>]+\/>/g, "")
+    .trim();
+
+  // Parse line by line
+  let currentKey = "";
+  let currentValue = "";
+
+  const flushCurrent = () => {
+    if (currentKey) {
+      data[currentKey] = currentValue.trim();
+    }
+  };
+
+  for (const line of cleanedFm.split("\n")) {
+    // key: value line
+    const kvMatch = line.match(/^([a-zA-Z_][\w-]*):\s*(.*)$/);
+    if (kvMatch) {
+      flushCurrent();
+      currentKey = kvMatch[1];
+      currentValue = kvMatch[2];
+    } else if (currentKey && line.startsWith("  ")) {
+      // continuation of multiline value
+      currentValue += " " + line.trim();
+    }
+  }
+  flushCurrent();
+
+  // Parse tools from JSON array string if needed
+  if (typeof data.tools === "string") {
+    const toolStr = data.tools as string;
+    if (toolStr.startsWith("[")) {
+      try {
+        data.tools = JSON.parse(toolStr);
+      } catch {
+        // leave as string
+      }
+    }
+  }
+
+  return { data, body };
+}
+
 export async function exportPluginToZip(plugin: Plugin): Promise<Blob> {
   const zip = new JSZip();
   const root = zip.folder(plugin.manifest.name)!;
@@ -119,9 +193,10 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
 
     if (relativePath.startsWith("agents/") && relativePath.endsWith(".md")) {
       const content = await zipFile.async("string");
-      const parsed = matter(content);
+      const { data, body } = parseAgentFile(content, relativePath.split("/").pop()!.replace(".md", ""));
+
       // Normalize tools: support both "Read, Write" string and ["Read","Write"] array
-      const rawTools = parsed.data.tools;
+      const rawTools = data.tools;
       let toolsArray: string[] = [];
       if (typeof rawTools === "string") {
         toolsArray = rawTools.split(",").map((t: string) => t.trim()).filter(Boolean);
@@ -131,16 +206,16 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
 
       const agent: AgentConfig = {
         id: crypto.randomUUID(),
-        name: parsed.data.name || relativePath.split("/").pop()!.replace(".md", ""),
-        description: parsed.data.description || "",
-        model: parsed.data.model || "inherit",
+        name: String(data.name || relativePath.split("/").pop()!.replace(".md", "")),
+        description: String(data.description || ""),
+        model: (data.model as AgentConfig["model"]) || "inherit",
         tools: toolsArray,
-        mcpServers: parsed.data.mcpServers || [],
-        permissionMode: parsed.data.permissionMode || "default",
-        maxTurns: parsed.data.maxTurns,
-        background: parsed.data.background || false,
-        memory: parsed.data.memory || "none",
-        systemPrompt: parsed.content.trim(),
+        mcpServers: (data.mcpServers as string[]) || [],
+        permissionMode: String(data.permissionMode || "default"),
+        maxTurns: data.maxTurns as number | undefined,
+        background: Boolean(data.background) || false,
+        memory: (data.memory as AgentConfig["memory"]) || "none",
+        systemPrompt: body,
       };
       result.agents!.push(agent);
     }
