@@ -23,25 +23,58 @@ import { Plugin, AgentConfig, SkillConfig, McpServer, CommandConfig } from "@/li
 type AnyNodeData = Record<string, unknown>;
 
 // ─── Inference ────────────────────────────────────────────────────────────────
-// How Claude Code knows which agents/skills/MCPs are related:
+// How Claude Code decides what's related — from the actual docs + real plugin analysis:
 //
-// 1. Agent.skills[] frontmatter  → explicit agent→skill link
-// 2. Agent.mcpServers[] frontmatter → explicit agent→MCP link
-// 3. Agent.tools includes "Agent(x,y)" → explicit orchestrator→worker link
-// 4. Command body mentions agent names → command→agent link (commands ARE orchestrators)
-// 5. Agent system prompt mentions skill/mcp names → inferred link
+// EXPLICIT (highest confidence):
+//   Agent.skills[] frontmatter  → agent→skill
+//   Agent.mcpServers[] frontmatter → agent→MCP
+//   Agent.tools "Agent(x,y)" → orchestrator→worker
 //
-// See: https://code.claude.com/docs/en/sub-agents#preload-skills-into-subagents
+// SEMI-EXPLICIT (command text patterns):
+//   subagent_type: plugin:agent-name → command→agent
+//   "email-personalization skill" exact string → command/agent→skill
+//
+// INFERRED (fuzzy text matching):
+//   Agent description/system prompt contains skill key words → agent→skill
+//   Agent description says "Apify MCP connector" → agent→mcp (if mcp name matches)
+//
+// Key insight: hyphenated names like "lead-qualification" WON'T match \b word boundaries
+// Solution: match on word-parts (≥4 chars) AND/OR exact slugified version
+
+// Try multiple strategies to find `name` in `text`
+function mentionedIn(text: string, name: string): boolean {
+  const lower = text.toLowerCase();
+  const nameLower = name.toLowerCase();
+
+  // 1. Exact match (e.g. "lead-qualifier" literally in text)
+  if (lower.includes(nameLower)) return true;
+
+  // 2. subagent_type: plugin:name or "sales:lead-qualifier"
+  if (lower.includes(`:${nameLower}`)) return true;
+
+  // 3. Space-separated version: "lead qualification" for "lead-qualification"
+  const spaced = nameLower.replace(/-/g, " ");
+  if (lower.includes(spaced)) return true;
+
+  // 4. Word-part scoring: all significant parts (≥4 chars) must appear
+  const parts = nameLower.split(/-/).filter((p) => p.length >= 4);
+  if (parts.length >= 2 && parts.every((p) => lower.includes(p))) return true;
+
+  // 5. If single word name, use word boundary
+  if (!nameLower.includes("-")) {
+    return new RegExp(`\\b${nameLower}\\b`, "i").test(text);
+  }
+
+  return false;
+}
 
 function findMentions(text: string, names: string[]): string[] {
-  return names.filter((name) => {
-    const escaped = name.replace(/[-_]/g, "[-_]?");
-    return new RegExp(`\\b${escaped}\\b`, "i").test(text);
-  });
+  return names.filter((name) => mentionedIn(text, name));
 }
 
 interface Relations {
   commandSpawnsAgents: Map<string, string[]>;   // commandId → [agentName]
+  commandUsesSkills: Map<string, string[]>;      // commandId → [skillName]
   agentSpawnsAgents: Map<string, string[]>;      // agentId → [agentName]
   agentUsesMcp: Map<string, string[]>;           // agentId → [mcpName]
   agentUsesSkill: Map<string, string[]>;         // agentId → [skillName]
@@ -49,6 +82,7 @@ interface Relations {
 
 function inferRelations(plugin: Plugin): Relations {
   const commandSpawnsAgents = new Map<string, string[]>();
+  const commandUsesSkills = new Map<string, string[]>();
   const agentSpawnsAgents = new Map<string, string[]>();
   const agentUsesMcp = new Map<string, string[]>();
   const agentUsesSkill = new Map<string, string[]>();
@@ -57,10 +91,14 @@ function inferRelations(plugin: Plugin): Relations {
   const skillNames = plugin.skills.map((s) => s.name);
   const mcpNames = plugin.mcpServers.map((m) => m.name);
 
-  // Commands → agents they spawn
+  // Commands → agents and skills they reference
   for (const cmd of (plugin.commands || [])) {
     const spawned = findMentions(cmd.content, agentNames);
     if (spawned.length > 0) commandSpawnsAgents.set(cmd.id, spawned);
+
+    // Commands can also directly reference skills
+    const usedSkills = findMentions(cmd.content, skillNames);
+    if (usedSkills.length > 0) commandUsesSkills.set(cmd.id, usedSkills);
   }
 
   for (const agent of plugin.agents) {
@@ -94,7 +132,7 @@ function inferRelations(plugin: Plugin): Relations {
     }
   }
 
-  return { commandSpawnsAgents, agentSpawnsAgents, agentUsesMcp, agentUsesSkill };
+  return { commandSpawnsAgents, commandUsesSkills, agentSpawnsAgents, agentUsesMcp, agentUsesSkill };
 }
 
 // ─── Graph builder ────────────────────────────────────────────────────────────
@@ -109,6 +147,7 @@ function buildGraph(
 
   const rel = inferRelations(plugin);
   const commands = plugin.commands || [];
+  const { commandUsesSkills } = rel;
 
   // Determine which agents are workers (spawned by something)
   const spawnedNames = new Set<string>();
@@ -261,6 +300,28 @@ function buildGraph(
           labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
           style: { stroke: "#4ade80", strokeWidth: 1.5, strokeDasharray: "5 3" },
           markerEnd: { type: MarkerType.ArrowClosed, color: "#4ade80", width: 14, height: 14 },
+        });
+      }
+    });
+  });
+
+  // Command → Skill (command text references a skill explicitly)
+  commandUsesSkills.forEach((skillNameList, cmdId) => {
+    skillNameList.forEach((skillName) => {
+      const skill = plugin.skills.find((s) => mentionedIn(skillName, s.name) || mentionedIn(s.name, skillName));
+      if (skill) {
+        edges.push({
+          id: `cmd-skill-${cmdId}-${skill.id}`,
+          source: `cmd-${cmdId}`,
+          target: `skill-${skill.id}`,
+          sourceHandle: "right",
+          targetHandle: "left",
+          type: "smoothstep",
+          label: "uses skill",
+          labelStyle: { fill: "#c084fc", fontSize: 10 },
+          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
+          style: { stroke: "#c084fc", strokeWidth: 1.5, strokeDasharray: "5 3" },
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#c084fc", width: 14, height: 14 },
         });
       }
     });
