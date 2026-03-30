@@ -1,6 +1,6 @@
 import JSZip from "jszip";
 import matter from "gray-matter";
-import { Plugin, AgentConfig, SkillConfig, McpServer } from "./plugin-types";
+import { Plugin, AgentConfig, SkillConfig, McpServer, CommandConfig } from "./plugin-types";
 
 // ─── Robust agent frontmatter parser ────────────────────────────────────────
 // Real-world agent files often have:
@@ -190,6 +190,7 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
     agents: [],
     skills: [],
     mcpServers: [],
+    commands: [],
     manifest: { name: "", version: "1.0.0" },
   };
 
@@ -275,6 +276,47 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
         result.skills!.push(skill);
       } catch (e) {
         console.warn(`Skipping skill ${rel}:`, e);
+      }
+      continue;
+    }
+
+    // ── commands/*.md ────────────────────────────────────────────────────────
+    // Commands are slash-commands / orchestrator entry points
+    if (rel.match(/^commands\/[^/]+\.md$/) && !rel.includes("/._")) {
+      const cmdName = rel.split("/")[1].replace(".md", "");
+      try {
+        const content = await zipFile.async("string");
+        // Parse frontmatter if present
+        const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+        let description = "";
+        let body = content;
+        let argumentHint: string | undefined;
+        let allowedTools: string[] | undefined;
+
+        if (match) {
+          body = match[2].trim();
+          // simple key: value parse
+          for (const line of match[1].split(/\r?\n/)) {
+            const kv = line.match(/^([a-zA-Z_-]+):\s*(.+)$/);
+            if (kv) {
+              if (kv[1] === "description") description = kv[2].trim();
+              if (kv[1] === "argument-hint") argumentHint = kv[2].trim();
+              if (kv[1] === "allowed-tools") allowedTools = kv[2].split(",").map(t => t.trim());
+            }
+          }
+        }
+
+        const cmd: CommandConfig = {
+          id: crypto.randomUUID(),
+          name: cmdName,
+          description: description || `/${cmdName} command`,
+          content: body,
+          argumentHint,
+          allowedTools,
+        };
+        result.commands!.push(cmd);
+      } catch (e) {
+        console.warn(`Skipping command ${rel}:`, e);
       }
       continue;
     }

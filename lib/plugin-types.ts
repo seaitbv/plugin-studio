@@ -37,12 +37,23 @@ export interface McpServer {
   env?: Record<string, string>;
 }
 
+export interface CommandConfig {
+  id: string;
+  name: string;
+  description: string;
+  content: string;           // full markdown body (the orchestration logic)
+  argumentHint?: string;
+  allowedTools?: string[];
+  disableModelInvocation?: boolean;
+}
+
 export interface Plugin {
   id: string;
   manifest: PluginManifest;
   agents: AgentConfig[];
   skills: SkillConfig[];
   mcpServers: McpServer[];
+  commands: CommandConfig[]; // entry-point commands (commands/ dir)
   hooks?: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;

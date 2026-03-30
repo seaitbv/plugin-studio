@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useEffect } from "react";
 import {
   ReactFlow,
   Background,
@@ -18,83 +18,83 @@ import {
   Panel,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Plugin, AgentConfig, SkillConfig, McpServer } from "@/lib/plugin-types";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+import { Plugin, AgentConfig, SkillConfig, McpServer, CommandConfig } from "@/lib/plugin-types";
 
 type AnyNodeData = Record<string, unknown>;
 
-// ─── Inference: build relationships from system prompt text ──────────────────
+// ─── Inference ────────────────────────────────────────────────────────────────
+// How Claude Code knows which agents/skills/MCPs are related:
+//
+// 1. Agent.skills[] frontmatter  → explicit agent→skill link
+// 2. Agent.mcpServers[] frontmatter → explicit agent→MCP link
+// 3. Agent.tools includes "Agent(x,y)" → explicit orchestrator→worker link
+// 4. Command body mentions agent names → command→agent link (commands ARE orchestrators)
+// 5. Agent system prompt mentions skill/mcp names → inferred link
+//
+// See: https://code.claude.com/docs/en/sub-agents#preload-skills-into-subagents
 
-function inferRelationships(plugin: Plugin): {
-  agentSpawns: Map<string, string[]>;       // orchestratorId → [workerName]
-  agentUsesMcp: Map<string, string[]>;      // agentId → [mcpName]
-  agentUsesSkill: Map<string, string[]>;    // agentId → [skillName]
-  commandSpawns: Map<string, string[]>;     // commandName → [agentName]
-} {
-  const agentSpawns = new Map<string, string[]>();
+function findMentions(text: string, names: string[]): string[] {
+  return names.filter((name) => {
+    const escaped = name.replace(/[-_]/g, "[-_]?");
+    return new RegExp(`\\b${escaped}\\b`, "i").test(text);
+  });
+}
+
+interface Relations {
+  commandSpawnsAgents: Map<string, string[]>;   // commandId → [agentName]
+  agentSpawnsAgents: Map<string, string[]>;      // agentId → [agentName]
+  agentUsesMcp: Map<string, string[]>;           // agentId → [mcpName]
+  agentUsesSkill: Map<string, string[]>;         // agentId → [skillName]
+}
+
+function inferRelations(plugin: Plugin): Relations {
+  const commandSpawnsAgents = new Map<string, string[]>();
+  const agentSpawnsAgents = new Map<string, string[]>();
   const agentUsesMcp = new Map<string, string[]>();
   const agentUsesSkill = new Map<string, string[]>();
-  const commandSpawns = new Map<string, string[]>();
 
   const agentNames = plugin.agents.map((a) => a.name);
   const skillNames = plugin.skills.map((s) => s.name);
   const mcpNames = plugin.mcpServers.map((m) => m.name);
 
-  // Helper: find all agent/skill/mcp names mentioned in a text block
-  function findMentions(text: string, names: string[]): string[] {
-    return names.filter((name) => {
-      const escaped = name.replace(/[-]/g, "[-_]?");
-      return new RegExp(`\\b${escaped}\\b`, "i").test(text);
-    });
+  // Commands → agents they spawn
+  for (const cmd of (plugin.commands || [])) {
+    const spawned = findMentions(cmd.content, agentNames);
+    if (spawned.length > 0) commandSpawnsAgents.set(cmd.id, spawned);
   }
 
-  // Analyze each agent's system prompt
   for (const agent of plugin.agents) {
-    const text = agent.systemPrompt + " " + agent.description;
-    const isOrchestrator = agent.tools.some((t) => t.startsWith("Agent")) ||
-      /orchestrat|spawn|sub.?agent|delegate|task tool/i.test(text);
+    const text = agent.systemPrompt + "\n" + agent.description;
 
-    if (isOrchestrator) {
-      // Check explicit Agent(...) in tools
-      const agentTool = agent.tools.find((t) => t.match(/^Agent\(/));
-      if (agentTool) {
-        const m = agentTool.match(/Agent\(([^)]+)\)/);
-        if (m) {
-          agentSpawns.set(agent.id, m[1].split(",").map((t) => t.trim()));
-        }
-      } else {
-        // Infer from system prompt mentions
-        const mentioned = findMentions(text, agentNames).filter((n) => n !== agent.name);
-        if (mentioned.length > 0) agentSpawns.set(agent.id, mentioned);
-      }
+    // Explicit: Agent(x,y) in tools
+    const agentTool = agent.tools.find((t) => t.match(/^Agent\(/));
+    if (agentTool) {
+      const m = agentTool.match(/Agent\(([^)]+)\)/);
+      if (m) agentSpawnsAgents.set(agent.id, m[1].split(",").map((t) => t.trim()));
+    } else if (/orchestrat|spawn|sub.?agent|delegate|task tool/i.test(text)) {
+      const mentioned = findMentions(text, agentNames).filter((n) => n !== agent.name);
+      if (mentioned.length > 0) agentSpawnsAgents.set(agent.id, mentioned);
     }
 
-    // Explicit mcpServers field
-    if (agent.mcpServers.length > 0) {
+    // MCP: explicit first, then inferred
+    if (agent.mcpServers?.length > 0) {
       agentUsesMcp.set(agent.id, agent.mcpServers);
     } else {
-      // Infer from prompt
       const mentioned = findMentions(text, mcpNames);
       if (mentioned.length > 0) agentUsesMcp.set(agent.id, mentioned);
     }
 
-    // Explicit skills field
-    const agentSkills = (agent as AgentConfig & { skills?: string[] }).skills || [];
-    if (agentSkills.length > 0) {
-      agentUsesSkill.set(agent.id, agentSkills);
+    // Skills: explicit first, then inferred
+    const explicitSkills = (agent as AgentConfig & { skills?: string[] }).skills || [];
+    if (explicitSkills.length > 0) {
+      agentUsesSkill.set(agent.id, explicitSkills);
     } else {
-      // Infer from prompt
       const mentioned = findMentions(text, skillNames);
       if (mentioned.length > 0) agentUsesSkill.set(agent.id, mentioned);
     }
   }
 
-  // Analyze commands (stored in plugin.hooks as a convention — or we derive from agent descriptions)
-  // Commands that mention agent names → they spawn those agents
-  // (commands are not stored as full objects yet, but we can look at agent descriptions for "spawned by")
-
-  return { agentSpawns, agentUsesMcp, agentUsesSkill, commandSpawns };
+  return { commandSpawnsAgents, agentSpawnsAgents, agentUsesMcp, agentUsesSkill };
 }
 
 // ─── Graph builder ────────────────────────────────────────────────────────────
@@ -107,71 +107,81 @@ function buildGraph(
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
-  const { agentSpawns, agentUsesMcp, agentUsesSkill } = inferRelationships(plugin);
+  const rel = inferRelations(plugin);
+  const commands = plugin.commands || [];
 
-  // Identify orchestrators vs workers
-  const orchestratorIds = new Set(agentSpawns.keys());
-  // Also mark agents that ARE targets of spawning
-  const workerNames = new Set<string>();
-  agentSpawns.forEach((targets) => targets.forEach((t) => workerNames.add(t)));
+  // Determine which agents are workers (spawned by something)
+  const spawnedNames = new Set<string>();
+  rel.commandSpawnsAgents.forEach((names) => names.forEach((n) => spawnedNames.add(n)));
+  rel.agentSpawnsAgents.forEach((names) => names.forEach((n) => spawnedNames.add(n)));
 
-  // ── Layout constants ───────────────────────────────────────────────────────
-  // Columns: MCP (x=0) | Orchestrators (x=260) | Workers (x=560) | Skills (x=860)
-  // If no orchestrator separation needed, all agents go in center
+  // Orchestrator agents = spawn others or are commands
+  const orchestratorAgentIds = new Set(rel.agentSpawnsAgents.keys());
 
-  const orchestrators = plugin.agents.filter((a) => orchestratorIds.has(a.id));
-  const workers = plugin.agents.filter((a) => !orchestratorIds.has(a.id));
-  const hasOrchestratorSplit = orchestrators.length > 0 && workers.length > 0;
+  // ── Column layout ──────────────────────────────────────────────────────────
+  // | MCP (x=0) | Commands (x=240) | Orchestrator Agents (x=500) | Worker Agents (x=760) | Skills (x=1020) |
+  // If no commands: shift everything left
+  // If no orchestrators: merge into one agent column
 
-  const COL_MCP = 0;
-  const COL_ORCH = hasOrchestratorSplit ? 260 : 280;
-  const COL_WORKER = hasOrchestratorSplit ? 580 : 280;
-  const COL_SKILL = hasOrchestratorSplit ? 880 : 560;
+  const hasCmds = commands.length > 0;
+  const hasOrchAgents = orchestratorAgentIds.size > 0;
+  const hasWorkers = plugin.agents.some((a) => spawnedNames.has(a.name));
 
-  const VGAP = 160;
-  const MCP_GAP = 130;
-  const SKILL_GAP = 130;
+  const COL_MCP      = 0;
+  const COL_CMD      = plugin.mcpServers.length > 0 ? 220 : 0;
+  const COL_ORCH     = COL_CMD + (hasCmds ? 260 : 0);
+  const COL_WORKER   = COL_ORCH + (hasOrchAgents || hasCmds ? 270 : 0);
+  const COL_SKILL    = COL_WORKER + (hasWorkers || hasOrchAgents ? 270 : 260);
+
+  const VGAP_AGENT   = 170;
+  const VGAP_SMALL   = 130;
 
   // ── MCP nodes ──────────────────────────────────────────────────────────────
   plugin.mcpServers.forEach((server, i) => {
     nodes.push({
       id: `mcp-${server.id}`,
       type: "mcpNode",
-      position: { x: COL_MCP, y: i * MCP_GAP + 40 },
+      position: { x: COL_MCP, y: i * VGAP_SMALL + 80 },
       data: { server },
     });
   });
 
-  // ── Orchestrator agent nodes ───────────────────────────────────────────────
-  orchestrators.forEach((agent, i) => {
+  // ── Command nodes (entry points) ──────────────────────────────────────────
+  commands.forEach((cmd, i) => {
+    nodes.push({
+      id: `cmd-${cmd.id}`,
+      type: "commandNode",
+      position: { x: COL_CMD, y: i * VGAP_SMALL + 40 },
+      data: { cmd },
+    });
+  });
+
+  // ── Agent nodes ────────────────────────────────────────────────────────────
+  const orchAgents = plugin.agents.filter((a) => orchestratorAgentIds.has(a.id) && !spawnedNames.has(a.name));
+  const workerAgents = plugin.agents.filter((a) => spawnedNames.has(a.name));
+  const soloAgents = plugin.agents.filter(
+    (a) => !orchestratorAgentIds.has(a.id) && !spawnedNames.has(a.name)
+  );
+
+  // Place orch agents
+  const xOrch = (hasCmds || plugin.mcpServers.length > 0) ? COL_ORCH : COL_ORCH;
+  [...orchAgents, ...soloAgents].forEach((agent, i) => {
     nodes.push({
       id: `agent-${agent.id}`,
       type: "agentNode",
-      position: { x: COL_ORCH, y: i * VGAP + 40 },
-      data: {
-        agent,
-        isOrchestrator: true,
-        onClick: onSelectAgent,
-        selected: agent.id === selectedAgentId,
-      },
+      position: { x: xOrch, y: i * VGAP_AGENT + 40 },
+      data: { agent, isOrchestrator: orchestratorAgentIds.has(agent.id), onClick: onSelectAgent, selected: agent.id === selectedAgentId },
       selected: agent.id === selectedAgentId,
     });
   });
 
-  // ── Worker / solo agent nodes ──────────────────────────────────────────────
-  const soloAgents = hasOrchestratorSplit ? workers : plugin.agents;
-  soloAgents.forEach((agent, i) => {
-    const isOrchestrator = orchestratorIds.has(agent.id);
+  // Place worker agents
+  workerAgents.forEach((agent, i) => {
     nodes.push({
       id: `agent-${agent.id}`,
       type: "agentNode",
-      position: { x: COL_WORKER, y: i * VGAP + 40 },
-      data: {
-        agent,
-        isOrchestrator,
-        onClick: onSelectAgent,
-        selected: agent.id === selectedAgentId,
-      },
+      position: { x: COL_WORKER, y: i * VGAP_AGENT + 40 },
+      data: { agent, isOrchestrator: false, onClick: onSelectAgent, selected: agent.id === selectedAgentId },
       selected: agent.id === selectedAgentId,
     });
   });
@@ -181,29 +191,52 @@ function buildGraph(
     nodes.push({
       id: `skill-${skill.id}`,
       type: "skillNode",
-      position: { x: COL_SKILL, y: i * SKILL_GAP + 40 },
+      position: { x: COL_SKILL, y: i * VGAP_SMALL + 40 },
       data: { skill },
     });
   });
 
-  // ── Edges: Orchestrator → Worker ───────────────────────────────────────────
-  agentSpawns.forEach((targetNames, sourceId) => {
-    targetNames.forEach((targetName, idx) => {
-      const target = plugin.agents.find(
-        (a) => a.name === targetName || a.name.includes(targetName) || targetName.includes(a.name)
-      );
+  // ── Edges ──────────────────────────────────────────────────────────────────
+
+  // Command → Agent (spawns)
+  rel.commandSpawnsAgents.forEach((agentNames, cmdId) => {
+    agentNames.forEach((agentName) => {
+      const agent = plugin.agents.find((a) => a.name === agentName || agentName.includes(a.name) || a.name.includes(agentName));
+      if (agent) {
+        edges.push({
+          id: `cmd-agent-${cmdId}-${agent.id}`,
+          source: `cmd-${cmdId}`,
+          target: `agent-${agent.id}`,
+          sourceHandle: "right",
+          targetHandle: "left",
+          type: "smoothstep",
+          animated: true,
+          label: "spawns",
+          labelStyle: { fill: "#f97316", fontSize: 10, fontWeight: 600 },
+          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
+          style: { stroke: "#f97316", strokeWidth: 2 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#f97316", width: 16, height: 16 },
+        });
+      }
+    });
+  });
+
+  // Agent → Agent (spawns)
+  rel.agentSpawnsAgents.forEach((targetNames, sourceId) => {
+    targetNames.forEach((targetName) => {
+      const target = plugin.agents.find((a) => a.name === targetName || targetName.includes(a.name) || a.name.includes(targetName));
       if (target) {
         edges.push({
-          id: `spawn-${sourceId}-${target.id}`,
+          id: `agent-agent-${sourceId}-${target.id}`,
           source: `agent-${sourceId}`,
           target: `agent-${target.id}`,
           sourceHandle: "right",
           targetHandle: "left",
           type: "smoothstep",
           animated: true,
-          label: "spawns",
+          label: "delegates",
           labelStyle: { fill: "#00d2ff", fontSize: 10, fontWeight: 600 },
-          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.8 },
+          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
           style: { stroke: "#00d2ff", strokeWidth: 2 },
           markerEnd: { type: MarkerType.ArrowClosed, color: "#00d2ff", width: 16, height: 16 },
         });
@@ -211,13 +244,13 @@ function buildGraph(
     });
   });
 
-  // ── Edges: MCP → Agent ────────────────────────────────────────────────────
-  agentUsesMcp.forEach((mcpNames, agentId) => {
+  // MCP → Agent
+  rel.agentUsesMcp.forEach((mcpNames, agentId) => {
     mcpNames.forEach((mcpName) => {
       const mcp = plugin.mcpServers.find((m) => m.name === mcpName);
       if (mcp) {
         edges.push({
-          id: `mcp-edge-${mcp.id}-${agentId}`,
+          id: `mcp-${mcp.id}-${agentId}`,
           source: `mcp-${mcp.id}`,
           target: `agent-${agentId}`,
           sourceHandle: "right",
@@ -225,7 +258,7 @@ function buildGraph(
           type: "smoothstep",
           label: "tools",
           labelStyle: { fill: "#4ade80", fontSize: 10 },
-          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.8 },
+          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
           style: { stroke: "#4ade80", strokeWidth: 1.5, strokeDasharray: "5 3" },
           markerEnd: { type: MarkerType.ArrowClosed, color: "#4ade80", width: 14, height: 14 },
         });
@@ -233,23 +266,21 @@ function buildGraph(
     });
   });
 
-  // ── Edges: Agent → Skill ──────────────────────────────────────────────────
-  agentUsesSkill.forEach((skillNames, agentId) => {
+  // Agent → Skill
+  rel.agentUsesSkill.forEach((skillNames, agentId) => {
     skillNames.forEach((skillName) => {
-      const skill = plugin.skills.find(
-        (s) => s.name === skillName || s.name.includes(skillName) || skillName.includes(s.name)
-      );
+      const skill = plugin.skills.find((s) => s.name === skillName || skillName.includes(s.name) || s.name.includes(skillName));
       if (skill) {
         edges.push({
-          id: `skill-edge-${agentId}-${skill.id}`,
+          id: `skill-${agentId}-${skill.id}`,
           source: `agent-${agentId}`,
           target: `skill-${skill.id}`,
           sourceHandle: "right",
           targetHandle: "left",
           type: "smoothstep",
-          label: "context",
+          label: "uses",
           labelStyle: { fill: "#c084fc", fontSize: 10 },
-          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.8 },
+          labelBgStyle: { fill: "#0f172a", fillOpacity: 0.85 },
           style: { stroke: "#c084fc", strokeWidth: 1.5, strokeDasharray: "5 3" },
           markerEnd: { type: MarkerType.ArrowClosed, color: "#c084fc", width: 14, height: 14 },
         });
@@ -260,61 +291,69 @@ function buildGraph(
   return { nodes, edges };
 }
 
+// ─── Node: Command ────────────────────────────────────────────────────────────
+
+function CommandNode({ data }: NodeProps) {
+  const { cmd } = data as { cmd: CommandConfig };
+  return (
+    <div className="rounded-xl border-2 border-orange-500/80 bg-orange-950/40 w-[185px] shadow-lg shadow-orange-500/10">
+      <Handle type="target" position={Position.Left} id="left"
+        style={{ background: "#f97316", width: 10, height: 10, border: "2px solid #0f172a" }} />
+      <Handle type="source" position={Position.Right} id="right"
+        style={{ background: "#f97316", width: 10, height: 10, border: "2px solid #0f172a" }} />
+      <div className="px-3 py-2 border-b border-orange-800/40 bg-orange-900/20 rounded-t-[10px]">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm">⚡</span>
+          <span className="font-semibold text-orange-200 text-xs truncate">/{cmd.name}</span>
+        </div>
+        <span className="text-xs text-orange-500">entry point</span>
+      </div>
+      <div className="px-3 py-2">
+        {cmd.description && (
+          <p className="text-xs text-orange-400/70 line-clamp-2 leading-tight">{cmd.description}</p>
+        )}
+        {cmd.argumentHint && (
+          <span className="text-xs font-mono text-orange-600 mt-1 block">{cmd.argumentHint}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Node: Agent ─────────────────────────────────────────────────────────────
 
 function AgentNode({ data }: NodeProps) {
   const { agent, isOrchestrator, onClick, selected } = data as {
-    agent: AgentConfig;
-    isOrchestrator: boolean;
-    onClick: (id: string) => void;
-    selected: boolean;
+    agent: AgentConfig; isOrchestrator: boolean; onClick: (id: string) => void; selected: boolean;
   };
-
   const modelBadge: Record<string, string> = {
     sonnet: "bg-blue-900/60 text-blue-300",
     opus: "bg-purple-900/60 text-purple-300",
     haiku: "bg-green-900/60 text-green-300",
     inherit: "bg-slate-700 text-slate-400",
   };
-
   return (
     <div
-      className={`rounded-xl border-2 cursor-pointer transition-all select-none w-[200px] ${
+      className={`rounded-xl border-2 cursor-pointer transition-all w-[200px] ${
         isOrchestrator
-          ? "bg-[#001d26] border-[#00d2ff] shadow-xl shadow-[#00d2ff]/20"
+          ? "bg-[#001d26] border-[#00d2ff] shadow-xl shadow-[#00d2ff]/15"
           : "bg-slate-800/90 border-slate-600 hover:border-slate-400"
       } ${selected ? "ring-2 ring-white/30" : ""}`}
       onClick={() => onClick(agent.id)}
     >
-      {/* Left handle — receives connections */}
-      <Handle
-        type="target"
-        position={Position.Left}
-        id="left"
-        style={{ background: isOrchestrator ? "#00d2ff" : "#64748b", width: 10, height: 10, border: "2px solid #0f172a" }}
-      />
-      {/* Right handle — sends connections */}
-      <Handle
-        type="source"
-        position={Position.Right}
-        id="right"
-        style={{ background: isOrchestrator ? "#00d2ff" : "#64748b", width: 10, height: 10, border: "2px solid #0f172a" }}
-      />
-
-      {/* Header */}
+      <Handle type="target" position={Position.Left} id="left"
+        style={{ background: isOrchestrator ? "#00d2ff" : "#64748b", width: 10, height: 10, border: "2px solid #0f172a" }} />
+      <Handle type="source" position={Position.Right} id="right"
+        style={{ background: isOrchestrator ? "#00d2ff" : "#64748b", width: 10, height: 10, border: "2px solid #0f172a" }} />
       <div className={`px-3 py-2 rounded-t-[10px] border-b ${
-        isOrchestrator ? "bg-[#00d2ff]/15 border-[#00d2ff]/30" : "bg-slate-700/50 border-slate-700"
+        isOrchestrator ? "bg-[#00d2ff]/10 border-[#00d2ff]/25" : "bg-slate-700/40 border-slate-700"
       }`}>
         <div className="flex items-center gap-2">
-          <span className="text-base leading-none">{isOrchestrator ? "🎯" : "🤖"}</span>
+          <span>{isOrchestrator ? "🎯" : "🤖"}</span>
           <span className="font-semibold text-sm text-slate-100 truncate">{agent.name}</span>
         </div>
-        {isOrchestrator && (
-          <span className="text-xs text-[#00d2ff]/80 font-medium">orchestrator</span>
-        )}
+        {isOrchestrator && <span className="text-xs text-[#00d2ff]/70 font-medium">orchestrator</span>}
       </div>
-
-      {/* Body */}
       <div className="px-3 py-2 space-y-1.5">
         {agent.description && (
           <p className="text-xs text-slate-400 line-clamp-2 leading-tight">{agent.description}</p>
@@ -325,7 +364,7 @@ function AgentNode({ data }: NodeProps) {
           </span>
           {agent.tools.length > 0 && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">
-              {agent.tools.length} tools
+              {agent.tools.length}t
             </span>
           )}
         </div>
@@ -339,16 +378,12 @@ function AgentNode({ data }: NodeProps) {
 function SkillNode({ data }: NodeProps) {
   const { skill } = data as { skill: SkillConfig };
   return (
-    <div className="rounded-xl border border-purple-700/60 bg-purple-950/40 w-[180px]">
-      <Handle
-        type="target"
-        position={Position.Left}
-        id="left"
-        style={{ background: "#c084fc", width: 10, height: 10, border: "2px solid #0f172a" }}
-      />
+    <div className="rounded-xl border border-purple-700/60 bg-purple-950/40 w-[175px]">
+      <Handle type="target" position={Position.Left} id="left"
+        style={{ background: "#c084fc", width: 10, height: 10, border: "2px solid #0f172a" }} />
       <div className="px-3 py-2 border-b border-purple-800/40 bg-purple-900/20 rounded-t-[10px]">
         <div className="flex items-center gap-1.5">
-          <span className="text-sm">📚</span>
+          <span>📚</span>
           <span className="font-medium text-purple-200 text-xs truncate">{skill.name}</span>
         </div>
         <span className="text-xs text-purple-500">skill</span>
@@ -368,41 +403,30 @@ function McpNode({ data }: NodeProps) {
   const { server } = data as { server: McpServer };
   return (
     <div className="rounded-xl border border-green-700/60 bg-green-950/40 w-[165px]">
-      <Handle
-        type="source"
-        position={Position.Right}
-        id="right"
-        style={{ background: "#4ade80", width: 10, height: 10, border: "2px solid #0f172a" }}
-      />
+      <Handle type="source" position={Position.Right} id="right"
+        style={{ background: "#4ade80", width: 10, height: 10, border: "2px solid #0f172a" }} />
       <div className="px-3 py-2 border-b border-green-800/40 bg-green-900/20 rounded-t-[10px]">
         <div className="flex items-center gap-1.5">
-          <span className="text-sm">🔌</span>
+          <span>🔌</span>
           <span className="font-medium text-green-200 text-xs truncate">{server.name}</span>
         </div>
         <span className="text-xs text-green-500">MCP server</span>
       </div>
       <div className="px-3 py-2">
         <span className="text-xs px-1.5 py-0.5 rounded bg-green-900/50 text-green-400 font-mono">{server.type}</span>
-        {server.command && (
-          <p className="text-xs text-green-600 mt-1 truncate font-mono">{server.command}</p>
-        )}
       </div>
     </div>
   );
 }
 
-const nodeTypes = { agentNode: AgentNode, skillNode: SkillNode, mcpNode: McpNode };
+const nodeTypes = { agentNode: AgentNode, skillNode: SkillNode, mcpNode: McpNode, commandNode: CommandNode };
 
-// ─── Main component ───────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function FlowEditor({
-  plugin,
-  onSelectAgent,
-  selectedAgentId,
+  plugin, onSelectAgent, selectedAgentId,
 }: {
-  plugin: Plugin;
-  onSelectAgent: (id: string) => void;
-  selectedAgentId: string | null;
+  plugin: Plugin; onSelectAgent: (id: string) => void; selectedAgentId: string | null;
 }) {
   const { nodes: init, edges: initEdges } = buildGraph(plugin, onSelectAgent, selectedAgentId);
   const [nodes, setNodes, onNodesChange] = useNodesState(init);
@@ -410,72 +434,54 @@ export default function FlowEditor({
 
   useEffect(() => {
     const { nodes: n, edges: e } = buildGraph(plugin, onSelectAgent, selectedAgentId);
-    setNodes(n);
-    setEdges(e);
+    setNodes(n); setEdges(e);
   }, [plugin, selectedAgentId, onSelectAgent, setNodes, setEdges]);
 
-  const isEmpty =
-    plugin.agents.length === 0 &&
-    plugin.skills.length === 0 &&
-    plugin.mcpServers.length === 0;
+  const isEmpty = !plugin.agents.length && !plugin.skills.length && !plugin.mcpServers.length && !(plugin.commands || []).length;
 
-  if (isEmpty) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-center">
-          <p className="text-5xl mb-4">🕸️</p>
-          <p className="text-slate-400 mb-2 font-medium">Flow is empty</p>
-          <p className="text-slate-600 text-sm">Add agents, skills, and MCP servers from the sidebar to visualize your plugin architecture</p>
-        </div>
+  if (isEmpty) return (
+    <div className="h-full flex items-center justify-center">
+      <div className="text-center">
+        <p className="text-5xl mb-4">🕸️</p>
+        <p className="text-slate-400 mb-1 font-medium">Flow is empty</p>
+        <p className="text-slate-600 text-sm">Add agents, skills, MCP servers, or import a plugin ZIP</p>
       </div>
-    );
-  }
+    </div>
+  );
 
   return (
     <div className="w-full h-full">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        minZoom={0.15}
-        maxZoom={2}
-        proOptions={{ hideAttribution: true }}
-      >
+      <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.2 }} minZoom={0.15} maxZoom={2}
+        proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} color="#1e293b" gap={24} size={1.5} />
-        <Controls
-          showInteractive={false}
-          style={{ background: "#1e293b", borderColor: "#334155" }}
-        />
-        <MiniMap
-          nodeColor={(n) => {
-            if (n.type === "mcpNode") return "#4ade80";
-            if (n.type === "skillNode") return "#c084fc";
-            const d = n.data as AnyNodeData;
-            return (d?.isOrchestrator as boolean) ? "#00d2ff" : "#475569";
-          }}
-          maskColor="rgba(10,15,30,0.85)"
-          style={{ background: "#0f172a", border: "1px solid #1e293b" }}
-        />
+        <Controls showInteractive={false} style={{ background: "#1e293b", borderColor: "#334155" }} />
+        <MiniMap nodeColor={(n) => {
+          if (n.type === "mcpNode") return "#4ade80";
+          if (n.type === "skillNode") return "#c084fc";
+          if (n.type === "commandNode") return "#f97316";
+          return (n.data as AnyNodeData)?.isOrchestrator ? "#00d2ff" : "#475569";
+        }} maskColor="rgba(10,15,30,0.85)" style={{ background: "#0f172a", border: "1px solid #1e293b" }} />
 
-        {/* Legend panel */}
         <Panel position="top-right">
-          <div className="bg-slate-900/90 border border-slate-700 rounded-xl px-4 py-3 backdrop-blur-sm shadow-xl">
-            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2.5">Legend</p>
-            <div className="space-y-2">
-              <LegendRow color="#00d2ff" label="Orchestrator spawns agent" solid />
-              <LegendRow color="#4ade80" label="MCP provides tools" dashed />
-              <LegendRow color="#c084fc" label="Agent uses skill" dashed />
+          <div className="bg-slate-900/90 border border-slate-700 rounded-xl px-4 py-3 backdrop-blur-sm shadow-xl min-w-[200px]">
+            <p className="text-xs font-bold text-slate-300 mb-3">How Claude reads this plugin</p>
+            <div className="space-y-2 mb-3">
+              <Row emoji="⚡" color="text-orange-400" label="Entry point" desc="User types /command" />
+              <Row emoji="🎯" color="text-[#00d2ff]" label="Orchestrator" desc="Spawns sub-agents" />
+              <Row emoji="🤖" color="text-slate-300" label="Worker agent" desc="Does the actual work" />
+              <Row emoji="🔌" color="text-green-400" label="MCP server" desc="External tools" />
+              <Row emoji="📚" color="text-purple-400" label="Skill" desc="Knowledge/context injected" />
             </div>
-            <div className="mt-3 pt-3 border-t border-slate-700 space-y-1.5">
-              <NodeLegend color="#00d2ff" emoji="🎯" label="Orchestrator agent" />
-              <NodeLegend color="#64748b" emoji="🤖" label="Worker agent" />
-              <NodeLegend color="#4ade80" emoji="🔌" label="MCP server" />
-              <NodeLegend color="#c084fc" emoji="📚" label="Skill / knowledge" />
+            <div className="border-t border-slate-700 pt-2.5 space-y-1.5">
+              <EdgeRow color="#f97316" label="spawns" solid />
+              <EdgeRow color="#00d2ff" label="delegates to" solid />
+              <EdgeRow color="#4ade80" label="provides tools" dashed />
+              <EdgeRow color="#c084fc" label="loads knowledge" dashed />
             </div>
+            <p className="text-xs text-slate-600 mt-2.5 leading-tight">
+              Links auto-detected from agent names, descriptions & system prompts
+            </p>
           </div>
         </Panel>
       </ReactFlow>
@@ -483,32 +489,25 @@ export default function FlowEditor({
   );
 }
 
-function LegendRow({ color, label, solid, dashed }: { color: string; label: string; solid?: boolean; dashed?: boolean }) {
+function Row({ emoji, color, label, desc }: { emoji: string; color: string; label: string; desc: string }) {
   return (
-    <div className="flex items-center gap-2">
-      <svg width="28" height="12" className="shrink-0">
-        <line
-          x1="0" y1="6" x2="20" y2="6"
-          stroke={color}
-          strokeWidth="2"
-          strokeDasharray={dashed ? "4 2" : undefined}
-        />
-        <polygon points="20,3 28,6 20,9" fill={color} />
-      </svg>
-      <span className="text-xs text-slate-400">{label}</span>
+    <div className="flex items-start gap-2">
+      <span className="text-sm w-5 shrink-0">{emoji}</span>
+      <div>
+        <span className={`text-xs font-semibold ${color}`}>{label}</span>
+        <p className="text-xs text-slate-500 leading-tight">{desc}</p>
+      </div>
     </div>
   );
 }
 
-function NodeLegend({ color, emoji, label }: { color: string; emoji: string; label: string }) {
+function EdgeRow({ color, label, solid, dashed }: { color: string; label: string; solid?: boolean; dashed?: boolean }) {
   return (
     <div className="flex items-center gap-2">
-      <div
-        className="w-4 h-4 rounded shrink-0 flex items-center justify-center text-xs"
-        style={{ border: `1.5px solid ${color}`, background: `${color}20` }}
-      >
-        {emoji}
-      </div>
+      <svg width="30" height="12" className="shrink-0">
+        <line x1="0" y1="6" x2="22" y2="6" stroke={color} strokeWidth="2" strokeDasharray={dashed ? "4 2" : undefined} />
+        <polygon points="22,3 30,6 22,9" fill={color} />
+      </svg>
       <span className="text-xs text-slate-400">{label}</span>
     </div>
   );

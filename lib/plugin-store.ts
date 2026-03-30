@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { Plugin, AgentConfig, SkillConfig, McpServer } from "./plugin-types";
+import { Plugin, AgentConfig, SkillConfig, McpServer, CommandConfig } from "./plugin-types";
 import { exportPluginToZip, importPluginFromZip } from "./zip-utils";
 
 interface PluginStore {
@@ -54,6 +54,7 @@ export const usePluginStore = create<PluginStore>()(
           agents: [],
           skills: [],
           mcpServers: [],
+          commands: [],
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -244,6 +245,7 @@ export const usePluginStore = create<PluginStore>()(
           agents: partial.agents || [],
           skills: partial.skills || [],
           mcpServers: partial.mcpServers || [],
+          commands: partial.commands || [],
           hooks: partial.hooks,
           createdAt: Date.now(),
           updatedAt: Date.now(),
