@@ -12,6 +12,7 @@ export interface AgentConfig {
   model: "inherit" | "sonnet" | "opus" | "haiku";
   tools: string[];
   mcpServers: string[];
+  skills: string[]; // skill names this agent uses
   permissionMode?: string;
   maxTurns?: number;
   background?: boolean;

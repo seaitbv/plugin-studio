@@ -207,6 +207,7 @@ export default function PluginEditorPage() {
                 <AgentPanel
                   agent={selectedAgent}
                   mcpServers={plugin.mcpServers}
+                  pluginSkills={plugin.skills}
                   onChange={(updates) => updateAgent(plugin.id, selectedAgent.id, updates)}
                   onClose={() => setActivePanel(null)}
                 />
@@ -279,9 +280,10 @@ function SidebarItem({ label, color, active, onClick, onDelete }: {
 import { AVAILABLE_TOOLS } from "@/lib/plugin-types";
 import { validateAgent, getToolSuggestion } from "@/lib/validate";
 
-function AgentPanel({ agent, mcpServers, onChange, onClose }: {
+function AgentPanel({ agent, mcpServers, pluginSkills, onChange, onClose }: {
   agent: AgentConfig;
   mcpServers: McpServer[];
+  pluginSkills: SkillConfig[];
   onChange: (u: Partial<AgentConfig>) => void;
   onClose: () => void;
 }) {
@@ -417,7 +419,7 @@ function AgentPanel({ agent, mcpServers, onChange, onClose }: {
       <Field label="MCP Servers" hint="Select servers available to this agent">
         <div className="flex flex-wrap gap-1.5 mt-1">
           {mcpServers.length === 0 ? (
-            <p className="text-xs text-slate-600">No MCP servers defined</p>
+            <p className="text-xs text-slate-600">No MCP servers defined yet</p>
           ) : (
             mcpServers.map((srv) => (
               <button
@@ -435,6 +437,33 @@ function AgentPanel({ agent, mcpServers, onChange, onClose }: {
                 }`}
               >
                 {srv.name}
+              </button>
+            ))
+          )}
+        </div>
+      </Field>
+
+      <Field label="Skills" hint="Skills preloaded into this agent's context">
+        <div className="flex flex-wrap gap-1.5 mt-1">
+          {pluginSkills.length === 0 ? (
+            <p className="text-xs text-slate-600">No skills defined yet</p>
+          ) : (
+            pluginSkills.map((skill) => (
+              <button
+                key={skill.id}
+                onClick={() => {
+                  const list = (agent.skills || []).includes(skill.name)
+                    ? (agent.skills || []).filter((s) => s !== skill.name)
+                    : [...(agent.skills || []), skill.name];
+                  onChange({ skills: list });
+                }}
+                className={`px-2 py-0.5 text-xs rounded border transition-colors ${
+                  (agent.skills || []).includes(skill.name)
+                    ? "border-purple-600/60 bg-purple-600/10 text-purple-400"
+                    : "border-slate-700 text-slate-500 hover:border-slate-500"
+                }`}
+              >
+                {skill.name}
               </button>
             ))
           )}

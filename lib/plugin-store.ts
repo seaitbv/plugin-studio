@@ -91,6 +91,7 @@ export const usePluginStore = create<PluginStore>()(
           model: "inherit",
           tools: [],
           mcpServers: [],
+          skills: [],
           permissionMode: "default",
           background: false,
           memory: "none",

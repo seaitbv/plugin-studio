@@ -239,6 +239,7 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
           mcpServers: Array.isArray(data.mcpServers)
             ? (data.mcpServers as string[])
             : [],
+          skills: Array.isArray(data.skills) ? (data.skills as string[]) : [],
           permissionMode: String(data.permissionMode ?? "default"),
           maxTurns: data.maxTurns != null ? Number(data.maxTurns) : undefined,
           background: Boolean(data.background),
