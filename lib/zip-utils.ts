@@ -93,9 +93,13 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
     manifest: { name: "", version: "1.0.0" },
   };
 
-  // Find root folder
+  // Find root folder — ignore macOS metadata dirs and hidden dirs
   const files = Object.keys(zip.files);
-  const topLevelDirs = [...new Set(files.map((f) => f.split("/")[0]))];
+  const topLevelDirs = [...new Set(
+    files
+      .map((f) => f.split("/")[0])
+      .filter((d) => d !== "__MACOSX" && !d.startsWith(".") && d !== "")
+  )];
   const rootPrefix = topLevelDirs.length === 1 ? topLevelDirs[0] + "/" : "";
 
   // Parse plugin.json
@@ -110,6 +114,7 @@ export async function importPluginFromZip(file: File): Promise<Partial<Plugin>> 
   // Parse agents
   for (const [path, zipFile] of Object.entries(zip.files)) {
     if (zipFile.dir) continue;
+    if (path.startsWith("__MACOSX/") || path.includes("/._")) continue;
     const relativePath = path.replace(rootPrefix, "");
 
     if (relativePath.startsWith("agents/") && relativePath.endsWith(".md")) {
